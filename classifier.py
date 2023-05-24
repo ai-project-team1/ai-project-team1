@@ -8,6 +8,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from rich import print
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import f1_score
 from torch.utils.data import DataLoader, random_split
 from tqdm import tqdm
 from transformers import BertForSequenceClassification, BertTokenizerFast
@@ -140,24 +142,33 @@ def contrastive_loss(embeddings, labels):
 
     # Normalize embeddings to unit length
     embeddings = F.normalize(embeddings, p=2, dim=1)
+    
+    hidden1, hidden2 = torch.chunk(embeddings, 2, 0)
+    size1 = hidden1.size(0)
+    size2 = hidden2.size(0)
 
-    # Compute pairwise distance between embeddings
-    dist = torch.cdist(embeddings, embeddings)
-
-    # Attract embeddings with the same label
-    # Repel embeddings with different labels
+    
     loss = torch.tensor(0.0, device=embeddings.device)
-    for i in range(batch_size):
-        for j in range(batch_size):
-            if i == j:
-                # Skip if same index
-                continue
-            if labels[i] == labels[j]:
-                # Attract if same label
-                loss += dist[i][j]
-            else:
-                # Repel if different label (distances are increased as the optimizer minimizes loss)
-                loss -= dist[i][j]
+    temp = 0.5
+    LARGE_NUM = 1e9
+            
+    labels1 = torch.eye(size1).to(device=embeddings.device)
+    masks1 = torch.eye(size1).to(device=embeddings.device) * LARGE_NUM
+    labels2 = torch.eye(size2).to(device=embeddings.device)
+    masks2 = torch.eye(size2).to(device=embeddings.device) * LARGE_NUM
+    
+    hidden1_large = hidden1
+    hidden2_large = hidden2
+    logits_aa = torch.mm(hidden1, hidden1_large.t()) / temp
+    logits_aa = logits_aa - masks1
+    logits_bb = torch.mm(hidden2, hidden2_large.t()) / temp
+    logits_bb = logits_bb - masks2
+    logits_ab = torch.mm(hidden1, hidden2_large.t()) / temp
+    logits_ba = torch.mm(hidden2, hidden1_large.t()) / temp
+
+    loss_a = F.cross_entropy(torch.cat([logits_ab, logits_aa], dim=1), labels1.argmax(dim=1))
+    loss_b = F.cross_entropy(torch.cat([logits_ba, logits_bb], dim=1), labels2.argmax(dim=1))
+    loss = loss_a + loss_b
 
     return loss / (batch_size * batch_size)
 
@@ -243,13 +254,22 @@ def main():
         args.exclude_emoji,
         args.exclude_demojize,
     )
+    # dataset, _ = train_test_split(
+    #     dataset, test_size = 0.9, random_state=args.dataset_split_seed
+    # )
     # Split dataset into train, valid, test
-    train_dataset, valid_dataset, test_dataset = random_split(
+    train_dataset, valid_test_dataset = train_test_split(
         dataset,
-        [0.8, 0.1, 0.1],
-        generator=torch.Generator().manual_seed(args.dataset_split_seed),
+        test_size = 0.2,
+        random_state = args.dataset_split_seed
     )
-
+    
+    valid_dataset, test_dataset = train_test_split(
+        valid_test_dataset,
+        test_size=0.5,
+        random_state = args.dataset_split_seed
+    )
+    
     best_accuracy = 0
     train_losses = []
     try:
@@ -520,3 +540,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# From the code above, are there any instances where the argument from Argparser is not used?
+# Answer: Yes, the argument "exclude_cl_loss" is not used. It is used to exclude contrastive loss, but it is not used in the code.

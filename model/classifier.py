@@ -8,9 +8,9 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from rich import print
+from rich.table import Table
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import f1_score
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import BertForSequenceClassification, BertTokenizerFast
 
@@ -142,21 +142,20 @@ def contrastive_loss(embeddings, labels):
 
     # Normalize embeddings to unit length
     embeddings = F.normalize(embeddings, p=2, dim=1)
-    
+
     hidden1, hidden2 = torch.chunk(embeddings, 2, 0)
     size1 = hidden1.size(0)
     size2 = hidden2.size(0)
 
-    
     loss = torch.tensor(0.0, device=embeddings.device)
     temp = 0.5
     LARGE_NUM = 1e9
-            
+
     labels1 = torch.eye(size1).to(device=embeddings.device)
     masks1 = torch.eye(size1).to(device=embeddings.device) * LARGE_NUM
     labels2 = torch.eye(size2).to(device=embeddings.device)
     masks2 = torch.eye(size2).to(device=embeddings.device) * LARGE_NUM
-    
+
     hidden1_large = hidden1
     hidden2_large = hidden2
     logits_aa = torch.mm(hidden1, hidden1_large.t()) / temp
@@ -166,8 +165,12 @@ def contrastive_loss(embeddings, labels):
     logits_ab = torch.mm(hidden1, hidden2_large.t()) / temp
     logits_ba = torch.mm(hidden2, hidden1_large.t()) / temp
 
-    loss_a = F.cross_entropy(torch.cat([logits_ab, logits_aa], dim=1), labels1.argmax(dim=1))
-    loss_b = F.cross_entropy(torch.cat([logits_ba, logits_bb], dim=1), labels2.argmax(dim=1))
+    loss_a = F.cross_entropy(
+        torch.cat([logits_ab, logits_aa], dim=1), labels1.argmax(dim=1)
+    )
+    loss_b = F.cross_entropy(
+        torch.cat([logits_ba, logits_bb], dim=1), labels2.argmax(dim=1)
+    )
     loss = loss_a + loss_b
 
     return loss / (batch_size * batch_size)
@@ -259,17 +262,17 @@ def main():
     # )
     # Split dataset into train, valid, test
     train_dataset, valid_test_dataset = train_test_split(
-        dataset,
-        test_size = 0.2,
-        random_state = args.dataset_split_seed
+        dataset, test_size=0.2, random_state=args.dataset_split_seed
     )
-    
+
     valid_dataset, test_dataset = train_test_split(
-        valid_test_dataset,
-        test_size=0.5,
-        random_state = args.dataset_split_seed
+        valid_test_dataset, test_size=0.5, random_state=args.dataset_split_seed
     )
-    
+
+    table = Table()
+    for column in ["Epoch", "All acc.", "E/I acc.", "N/S acc.", "T/F acc.", "J/P acc."]:
+        table.add_column(column)
+
     best_accuracy = 0
     train_losses = []
     try:
@@ -394,9 +397,13 @@ def main():
                         )
                         loss = ce_loss + args.alpha * cl_loss
 
+                    prediction = torch.round(
+                        torch.sigmoid(output.logits.to("cpu"))
+                    ).type(torch.long)
+
                     accuracy, ei_acc, sn_acc, tf_acc, jp_acc = accuracy_score(
                         mbti_labels.type(torch.long),
-                        torch.round(torch.sigmoid(output.logits.to("cpu"))),
+                        prediction,
                     )
                     all_accuracy.extend(accuracy)
                     all_ei_accuracy.extend(ei_acc)
@@ -426,11 +433,15 @@ def main():
                     ),
                 )
 
-            print(
-                f"Epoch {epoch + 1}/{args.epochs} | Accuracy: {np.mean(all_accuracy):.4f} "
-                f"E/I: {np.mean(all_ei_accuracy):.4f} S/N: {np.mean(all_sn_accuracy):.4f} "
-                f"T/F: {np.mean(all_tf_accuracy):.4f} J/P: {np.mean(all_jp_accuracy):.4f}"
+            table.add_row(
+                f"Epoch {epoch + 1}",
+                f"{np.mean(all_accuracy):.4f}",
+                f"{np.mean(all_ei_accuracy):.4f}",
+                f"{np.mean(all_sn_accuracy):.4f}",
+                f"{np.mean(all_tf_accuracy):.4f}",
+                f"{np.mean(all_jp_accuracy):.4f}",
             )
+            print(table)
 
     except KeyboardInterrupt:
         print("Keyboard interrupt")
@@ -457,6 +468,10 @@ def main():
     all_sn_accuracy = []
     all_tf_accuracy = []
     all_jp_accuracy = []
+
+    predictions = []
+    ground_truth = []
+
     with torch.no_grad():
         for user_ids, mbti_labels, mbti_indices, mbtis, posts in test_dataloader_iter:
             posts_tokenized = tokenizer(
@@ -486,6 +501,13 @@ def main():
                 )
                 loss = ce_loss + args.alpha * cl_loss
 
+            prediction = torch.round(torch.sigmoid(output.logits.to("cpu"))).type(
+                torch.long
+            )
+
+            predictions.extend(prediction.tolist())
+            ground_truth.extend(mbti_labels.type(torch.long).tolist())
+
             # Calculate accuracy
             accuracy, ei_acc, sn_acc, tf_acc, jp_acc = accuracy_score(
                 mbti_labels.type(torch.long),
@@ -504,15 +526,15 @@ def main():
                 accuracy=np.mean(all_accuracy),
             )
 
-    print(
-        {
-            "test_accuracy": np.mean(all_accuracy),
-            "test_ei_accuracy": np.mean(all_ei_accuracy),
-            "test_sn_accuracy": np.mean(all_sn_accuracy),
-            "test_tf_accuracy": np.mean(all_tf_accuracy),
-            "test_jp_accuracy": np.mean(all_jp_accuracy),
-        }
+    table.add_row(
+        "Test",
+        f"{np.mean(all_accuracy):.4f}",
+        f"{np.mean(all_ei_accuracy):.4f}",
+        f"{np.mean(all_sn_accuracy):.4f}",
+        f"{np.mean(all_tf_accuracy):.4f}",
+        f"{np.mean(all_jp_accuracy):.4f}",
     )
+    print(table)
 
     json.dump(
         {
@@ -524,6 +546,17 @@ def main():
             "test_jp_accuracy": np.mean(all_jp_accuracy),
         },
         open(f"model_{timestamp}.json", "w"),
+        indent=1,
+        ensure_ascii=False,
+    )
+
+    # Save prediction
+    json.dump(
+        {
+            "predictions": predictions,
+            "ground_truth": ground_truth,
+        },
+        open(os.path.join(args.model_checkpoint_path, f"model_{timestamp}.json"), "w"),
         indent=1,
         ensure_ascii=False,
     )
@@ -540,6 +573,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-# From the code above, are there any instances where the argument from Argparser is not used?
-# Answer: Yes, the argument "exclude_cl_loss" is not used. It is used to exclude contrastive loss, but it is not used in the code.

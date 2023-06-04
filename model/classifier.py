@@ -121,9 +121,9 @@ def accuracy_score(y_true: torch.Tensor, y_pred: torch.Tensor):
     )
 
 
-def contrastive_loss(embeddings, labels):
+def contrastive_loss(embeddings, labels: list[str]):
     """
-    Compute contrastive loss
+    Compute InfoNCE loss
     The loss is computed by:
     * Attract CLS vector embeddings with the same MBTI
     * Repel CLS vector embeddings with different MBTI
@@ -132,7 +132,7 @@ def contrastive_loss(embeddings, labels):
     with different MBTI
 
     :param embeddings: (batch_size, embedding_size)
-    :param labels: (batch_size) 0 ~ 15
+    :param labels: (batch_size) MBTI labels
     :return: contrastive loss
     """
     if len(embeddings.shape) == 3:
@@ -140,79 +140,49 @@ def contrastive_loss(embeddings, labels):
 
     batch_size = embeddings.shape[0]
 
-    # Normalize embeddings to unit length
+    # Normalize embeddings to unit length for fast cosine distance computation
     embeddings = F.normalize(embeddings, p=2, dim=1)
 
-    hidden1, hidden2 = torch.chunk(embeddings, 2, 0)
-    size1 = hidden1.size(0)
-    size2 = hidden2.size(0)
+    loss = []  # (batch_size)
+    for i in range(batch_size):
+        positive_overlap = 0
+        positive_idx = 0
 
-    loss = torch.tensor(0.0, device=embeddings.device)
-    temp = 0.5
-    LARGE_NUM = 1e9
+        negatives = []  # Negative indices
 
-    labels1 = torch.eye(size1).to(device=embeddings.device)
-    masks1 = torch.eye(size1).to(device=embeddings.device) * LARGE_NUM
-    labels2 = torch.eye(size2).to(device=embeddings.device)
-    masks2 = torch.eye(size2).to(device=embeddings.device) * LARGE_NUM
+        for j, mbti in enumerate(labels):
+            if i == j:
+                continue
+            # Count overlapping MBTIs
+            overlap = 0
+            for c1, c2 in zip(labels[i], mbti):
+                if c1 == c2:
+                    overlap += 1
 
-    hidden1_large = hidden1
-    hidden2_large = hidden2
-    logits_aa = torch.mm(hidden1, hidden1_large.t()) / temp
-    logits_aa = logits_aa - masks1
-    logits_bb = torch.mm(hidden2, hidden2_large.t()) / temp
-    logits_bb = logits_bb - masks2
-    logits_ab = torch.mm(hidden1, hidden2_large.t()) / temp
-    logits_ba = torch.mm(hidden2, hidden1_large.t()) / temp
+            if overlap > positive_overlap:
+                positive_overlap = overlap
+                positive_idx = j
 
-    loss_a = F.cross_entropy(
-        torch.cat([logits_ab, logits_aa], dim=1), labels1.argmax(dim=1)
-    )
-    loss_b = F.cross_entropy(
-        torch.cat([logits_ba, logits_bb], dim=1), labels2.argmax(dim=1)
-    )
-    loss = loss_a + loss_b
+            elif overlap < 2:
+                negatives.append(j)
 
-    return loss / (batch_size * batch_size)
+        try:
+            anchor = embeddings[i]  # (embedding_size)
+            positive = embeddings[positive_idx]  # (embedding_size)
+            negative = embeddings[negatives]  # (num_negatives, embedding_size)
 
+            numerator = torch.exp(torch.dot(anchor, positive))
 
-def contrastive_loss_multi_label(embeddings, labels):
-    """
-    Compute contrastive loss
-    The loss is computed by:
-    * Attract CLS vector embeddings with the same MBTI
-    * Repel CLS vector embeddings with different MBTI
-    Attracting and repelling are computed by pairwise distance between two embeddings
-    by reducing the distance between embeddings with the same MBTI and increasing the distance between embeddings
-    with different MBTI
+            loss.append(
+                -torch.log(
+                    numerator
+                    / (numerator + torch.sum(torch.exp(torch.mv(negative, anchor))))
+                )
+            )
+        except:
+            loss.append(torch.nan)
 
-    :param embeddings: (batch_size, embedding_size)
-    :param labels: (batch_size, batch_size) 1 to attract, -1 to repel, 0 to ignore
-    :return: contrastive loss
-    """
-    assert len(embeddings.shape) == 2, "Embeddings must be 2-dimensional"
-
-    batch_size = embeddings.shape[0]
-
-    # Normalize embeddings to unit length
-    embeddings = F.normalize(embeddings, p=2, dim=1)  # (batch_size, embedding_size)
-
-    # Compute pairwise distance between embeddings
-    dist = torch.cdist(embeddings, embeddings)  # (batch_size, batch_size)
-
-    # Set diagonal of labels to 0
-    labels[torch.eye(batch_size, dtype=torch.bool)] = 0
-
-    # Attract embeddings with the same label
-    # Repel embeddings with different labels
-    loss = torch.mul(dist, labels)  # (batch_size, batch_size)
-
-    # Ignore 0 labels
-    labels[labels == 0] = torch.nan
-
-    loss = torch.nanmean(loss)
-
-    return loss
+    return torch.nanmean(torch.stack(loss))
 
 
 def main():
@@ -323,9 +293,7 @@ def main():
                     # Use CLS vector of the last hidden state as the embedding
                     # output.hidden_states[-1]: (batch_size, max_seq_len, hidden_size)
                     # output.hidden_states[-1][:, 0, :]: (batch_size, hidden_size) [CLS] vector
-                    cl_loss = contrastive_loss(
-                        output.hidden_states[-1][:, 0, :], mbti_indices
-                    )
+                    cl_loss = contrastive_loss(output.hidden_states[-1][:, 0, :], mbtis)
 
                     # Weighted sum of cross-entropy loss and contrastive loss
                     loss = ce_loss + args.alpha * cl_loss
@@ -393,7 +361,7 @@ def main():
                         # output.hidden_states[-1]: (batch_size, max_seq_len, hidden_size)
                         # output.hidden_states[-1][:, 0, :]: (batch_size, hidden_size) [CLS] vector
                         cl_loss = contrastive_loss(
-                            output.hidden_states[-1][:, 0, :], mbti_indices
+                            output.hidden_states[-1][:, 0, :], mbtis
                         )
                         loss = ce_loss + args.alpha * cl_loss
 
@@ -497,7 +465,7 @@ def main():
                 # output.hidden_states[-1]: (batch_size, max_seq_len, hidden_size)
                 # output.hidden_states[-1][:, 0, :]: (batch_size, hidden_size) [CLS] vector
                 cl_loss = contrastive_loss(
-                    output.hidden_states[-1][:, 0, :], mbti_indices
+                    output.hidden_states[-1][:, 0, :], mbtis
                 )
                 loss = ce_loss + args.alpha * cl_loss
 
